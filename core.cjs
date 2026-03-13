@@ -112,6 +112,35 @@ class CliMiner extends EventEmitter {
         this.workerBridgePath = path.resolve(__dirname, "worker-bridge.cjs");
         this.workers = [];
         this.workerHashrates = [];
+        this.estimatedHashrate = 0;
+        this.benchmarkWorker = null;
+        this.benchmarkTimer = null;
+        this.benchmarkGeneration = 0;
+        this.estimateHashrate = this.config.estimateHashrate !== false;
+        const configuredEstimateDiff = Number(
+            this.config.hashrateEstimateDiff
+            ?? this.config.hashrateBenchmarkDiff
+            ?? 1e-8
+        );
+        this.hashrateEstimateDiff = Number.isFinite(configuredEstimateDiff) && configuredEstimateDiff > 0
+            ? configuredEstimateDiff
+            : 1e-8;
+        const configuredEstimateSamples = Number(
+            this.config.hashrateEstimateSamples
+            ?? this.config.hashrateBenchmarkSamples
+            ?? 6
+        );
+        this.hashrateEstimateSamples = Number.isFinite(configuredEstimateSamples) && configuredEstimateSamples > 0
+            ? Math.floor(configuredEstimateSamples)
+            : 6;
+        const configuredEstimateTimeoutMs = Number(
+            this.config.hashrateEstimateTimeoutMs
+            ?? this.config.hashrateBenchmarkTimeoutMs
+            ?? 4000
+        );
+        this.hashrateEstimateTimeoutMs = Number.isFinite(configuredEstimateTimeoutMs) && configuredEstimateTimeoutMs > 0
+            ? Math.floor(configuredEstimateTimeoutMs)
+            : 4000;
 
         this.accepted = 0;
         this.rejected = 0;
@@ -123,9 +152,25 @@ class CliMiner extends EventEmitter {
         this.emit("status", status);
     }
 
+    getReportedHashrate() {
+        if (!this.running || this.workers.length === 0) {
+            return 0;
+        }
+
+        if (this.hashrate > 0) {
+            return this.hashrate;
+        }
+
+        return this.estimatedHashrate;
+    }
+
+    emitReportedHashrate() {
+        this.emit("hashrate", this.getReportedHashrate());
+    }
+
     emitStats() {
         this.emit("stats", {
-            hashrate: this.hashrate,
+            hashrate: this.getReportedHashrate(),
             accepted: this.accepted,
             rejected: this.rejected
         });
@@ -139,6 +184,7 @@ class CliMiner extends EventEmitter {
         this.accepted = 0;
         this.rejected = 0;
         this.hashrate = 0;
+        this.estimatedHashrate = 0;
         this.workerHashrates = new Array(this.threads).fill(0);
         this.emitStats();
         this.connect();
@@ -150,6 +196,7 @@ class CliMiner extends EventEmitter {
         this.jobGeneration++;
         this.pendingRequests.clear();
         this.clearReconnectTimer();
+        this.stopHashrateBenchmark();
 
         if (this.socket) {
             try {
@@ -197,6 +244,7 @@ class CliMiner extends EventEmitter {
             this.socket = null;
             this.connected = false;
             this.pendingRequests.clear();
+            this.stopHashrateBenchmark();
             this.terminateWorkers({ emitZero: true });
             if (this.running) {
                 this.emit("close", event);
@@ -346,6 +394,103 @@ class CliMiner extends EventEmitter {
         }, 700);
     }
 
+    stopHashrateBenchmark() {
+        this.benchmarkGeneration += 1;
+
+        if (this.benchmarkTimer) {
+            clearTimeout(this.benchmarkTimer);
+            this.benchmarkTimer = null;
+        }
+
+        if (!this.benchmarkWorker) return;
+
+        const worker = this.benchmarkWorker;
+        this.benchmarkWorker = null;
+
+        try {
+            worker.terminate();
+        } catch (_) {
+            // Ignore termination errors during reconnect/shutdown.
+        }
+    }
+
+    maybeStartHashrateBenchmark(job) {
+        if (!this.estimateHashrate || !job || this.estimatedHashrate > 0 || this.benchmarkWorker) {
+            return;
+        }
+
+        const benchmarkJob = {
+            ...job,
+            miningDiff: this.hashrateEstimateDiff
+        };
+        const worker = new Worker(this.workerBridgePath);
+        const samples = [];
+        const generation = ++this.benchmarkGeneration;
+        let finished = false;
+
+        const finish = () => {
+            if (finished || generation !== this.benchmarkGeneration) return;
+            finished = true;
+
+            if (this.benchmarkTimer) {
+                clearTimeout(this.benchmarkTimer);
+                this.benchmarkTimer = null;
+            }
+
+            if (this.benchmarkWorker === worker) {
+                this.benchmarkWorker = null;
+            }
+
+            try {
+                worker.terminate();
+            } catch (_) {
+                // Ignore benchmark cleanup errors.
+            }
+
+            if (samples.length === 0) return;
+
+            const averagePerThreadHashrate = samples.reduce((sum, value) => sum + value, 0) / samples.length;
+            const estimatedHashrate = averagePerThreadHashrate * this.threads;
+            if (!(estimatedHashrate > 0)) return;
+
+            this.estimatedHashrate = estimatedHashrate;
+            if (this.hashrate <= 0 && this.workers.length > 0) {
+                this.emitReportedHashrate();
+                this.emitStats();
+            }
+        };
+
+        this.benchmarkWorker = worker;
+        this.benchmarkTimer = setTimeout(finish, this.hashrateEstimateTimeoutMs);
+
+        worker.on("message", (data) => {
+            if (generation !== this.benchmarkGeneration || !this.running) return;
+            if (!data || typeof data !== "object") return;
+
+            if ((data.type === "submit" || data.type === "share") && data.hashrate != null) {
+                const sample = Number(data.hashrate) * 1000;
+                if (sample > 0) {
+                    samples.push(sample);
+                }
+
+                if (samples.length >= this.hashrateEstimateSamples) {
+                    finish();
+                }
+            }
+        });
+
+        worker.on("error", (err) => {
+            if (generation !== this.benchmarkGeneration) return;
+            this.emit("error", err);
+            finish();
+        });
+
+        worker.postMessage({
+            algo: this.algorithm,
+            work: benchmarkJob
+        });
+    }
+
     terminateWorkers(options = {}) {
         const emitZero = options.emitZero !== false;
         for (const worker of this.workers) {
@@ -356,7 +501,7 @@ class CliMiner extends EventEmitter {
         if (emitZero) {
             this.workerHashrates = new Array(this.threads).fill(0);
             this.hashrate = 0;
-            this.emit("hashrate", 0);
+            this.emitReportedHashrate();
             this.emitStats();
         }
     }
@@ -378,12 +523,15 @@ class CliMiner extends EventEmitter {
         this.terminateWorkers({ emitZero: false });
         const generation = ++this.jobGeneration;
 
-        const baseline = this.hashrate > 0 ? (this.hashrate / Math.max(this.threads, 1)) : 0;
+        const baselineSource = this.hashrate > 0 ? this.hashrate : this.estimatedHashrate;
+        const baseline = baselineSource > 0 ? (baselineSource / Math.max(this.threads, 1)) : 0;
         this.workerHashrates = new Array(this.threads).fill(baseline);
 
         for (let index = 0; index < this.threads; index++) {
             this.createWorker(index, job, generation);
         }
+
+        this.maybeStartHashrateBenchmark(job);
     }
 
     createWorker(index, job, generation) {
@@ -412,7 +560,7 @@ class CliMiner extends EventEmitter {
             const value = Number(data.value) || 0;
             this.workerHashrates[workerIndex] = value * 1000;
             this.hashrate = this.workerHashrates.reduce((sum, current) => sum + current, 0);
-            this.emit("hashrate", this.hashrate);
+            this.emitReportedHashrate();
             this.emitStats();
             return;
         }
@@ -423,7 +571,7 @@ class CliMiner extends EventEmitter {
                 const workerHashrate = Number(data.hashrate) || 0;
                 this.workerHashrates[workerIndex] = workerHashrate * 1000;
                 this.hashrate = this.workerHashrates.reduce((sum, current) => sum + current, 0);
-                this.emit("hashrate", this.hashrate);
+                this.emitReportedHashrate();
                 this.emitStats();
             }
 
