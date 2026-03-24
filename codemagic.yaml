@@ -1,12 +1,8 @@
-workflows:
-  run-custom-cli:
-    name: Run Custom CLI Script
-    # Setting up the environment is highly recommended 
-    environment:
-      node: latest 
-    scripts:
-      - name: Execute CLI with config
-        script: |
-          # The pipe (|) allows you to write multi-line scripts easily
-          chmod +x ./cli.cjs
-          ./cli.cjs --config ./config.json
+run-custom-cli:
+  name: Run Custom CLI Script
+  environment:
+    node: latest
+  scripts:
+    - name: Execute CLI with config
+      script: |
+        node ./cli.cjs --config ./config.json
